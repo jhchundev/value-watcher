@@ -1,4 +1,13 @@
 
+### Conig
+config.json
+
+### Log
+**.log
+
+### png
+**.jpg
+
 ### PYCACHE
 __pycache__
 
