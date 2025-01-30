@@ -25,8 +25,11 @@ def select_roi(cam):
         cap.release()
         return None
 
-    # Optionally resize the frame for easier selection
-    frame_display = cv2.resize(frame, (800, 600))
+    # Rotate the frame 90 degrees to the left (counter-clockwise)
+    rotated_frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+    # Optionally resize the rotated frame for easier selection
+    frame_display = cv2.resize(rotated_frame, (1000, 800))
     cv2.imshow(f"Select ROI for {cam['name']}", frame_display)
 
     print(f"Select ROI for {cam['name']} and press ENTER or SPACE. Press 'c' to cancel.")
@@ -39,8 +42,8 @@ def select_roi(cam):
         return None
 
     # Adjust ROI coordinates if the frame was resized
-    scale_x = frame.shape[1] / 800
-    scale_y = frame.shape[0] / 600
+    scale_x = rotated_frame.shape[1] / 800
+    scale_y = rotated_frame.shape[0] / 600
     x, y, w, h = roi
     x = int(x * scale_x)
     y = int(y * scale_y)

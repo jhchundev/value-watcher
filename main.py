@@ -127,6 +127,7 @@ def recognize_number(frame, roi_coords, expected_number=None):
 
     return recognized_number
 
+
 def check_webcam_status(cam, timeout=5, retries=3):
     """
     Checks if a specific webcam is accessible and functional with retries.
@@ -143,10 +144,21 @@ def check_webcam_status(cam, timeout=5, retries=3):
     for attempt in range(retries):
         with suppress_stderr():
             cap = cv2.VideoCapture(cam['index'])
+
         if not cap.isOpened():
-            logging.error(f"{cam['name']} (Index {cam['index']}) could not be opened. Attempt {attempt + 1} of {retries}.")
+            logging.error(
+                f"{cam['name']} (Index {cam['index']}) could not be opened. Attempt {attempt + 1} of {retries}.")
             time.sleep(1)
             continue
+
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1000)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 800)
+
+        # Verify if the resolution is set correctly
+        actual_width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+        actual_height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        logging.info(
+            f"{cam['name']} (Index {cam['index']}): Resolution set to {int(actual_width)}x{int(actual_height)}")
 
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         start_time = time.time()
