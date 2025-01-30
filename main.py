@@ -155,9 +155,14 @@ def check_webcam_status(cam, timeout=5, retries=3):
         while True:
             ret, frame = cap.read()
             if ret:
-                recognized_number = recognize_number(frame,
-                                                      (cam['roi']['x'], cam['roi']['y'], cam['roi']['w'], cam['roi']['h']),
-                                                      cam.get('expected_number'))
+                # Rotate the frame 90 degrees to the left (counter-clockwise)
+                rotated_frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+                recognized_number = recognize_number(
+                    rotated_frame,
+                    (cam['roi']['x'], cam['roi']['y'], cam['roi']['w'], cam['roi']['h']),
+                    cam.get('expected_number')
+                )
                 if recognized_number is not None:
                     logging.info(f"{cam['name']} (Index {cam['index']}): Recognized Number: {recognized_number}")
                     cap.release()
