@@ -151,14 +151,9 @@ def check_webcam_status(cam, timeout=5, retries=3):
             time.sleep(1)
             continue
 
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1000)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 800)
-
-        # Verify if the resolution is set correctly
-        actual_width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-        actual_height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-        logging.info(
-            f"{cam['name']} (Index {cam['index']}): Resolution set to {int(actual_width)}x{int(actual_height)}")
+        # **Set the desired resolution (1000x800)**
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 800)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 600)
 
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         start_time = time.time()
@@ -167,7 +162,7 @@ def check_webcam_status(cam, timeout=5, retries=3):
         while True:
             ret, frame = cap.read()
             if ret:
-                # Rotate the frame 90 degrees to the left (counter-clockwise)
+                # Rotate the frame 90 degrees to the left (counter-clockwise) if necessary
                 rotated_frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
                 recognized_number = recognize_number(
