@@ -15,12 +15,9 @@ import pytesseract
 from PIL import Image
 import numpy as np
 
-# ================== Configuration Loader ==================
+from config import load_config
 
-def load_config(config_file='config.json'):
-    with open(config_file, 'r') as f:
-        config = json.load(f)
-    return config
+# ================== Configuration Loader ==================
 
 config = load_config()
 
@@ -113,11 +110,25 @@ def recognize_number(frame, roi_coords, expected_number=None):
 
     # OCR
     pil_img = Image.fromarray(processed)
-    config = '--psm 8 --oem 3 -c tessedit_char_whitelist=0123456789'
-    recognized_text = pytesseract.image_to_string(pil_img, config=config)
+    custom_config = r'--oem 3 --psm 8 -c tessedit_char_whitelist=0123456789'
+    data = pytesseract.image_to_data(pil_img, config=custom_config, output_type=pytesseract.Output.DICT)
 
-    # Clean the recognized text
-    recognized_number = ''.join(filter(str.isdigit, recognized_text))
+    recognized_number = ''
+    confidences = []
+
+    for i, word in enumerate(data['text']):
+        if word.strip().isdigit():
+            recognized_number += word.strip()
+            confidences.append(int(data['conf'][i]))
+
+    if not recognized_number:
+        logging.warning("No valid digits recognized.")
+        return None
+
+    average_confidence = np.mean(confidences)
+    if average_confidence < 0.5:
+        logging.warning(f"Low OCR confidence ({average_confidence:.2f}%). Recognized number: {recognized_number}")
+        return None
 
     # Validation (optional)
     if expected_number is not None:
@@ -128,19 +139,24 @@ def recognize_number(frame, roi_coords, expected_number=None):
     return recognized_number
 
 
+def recognize_number_aggregated(frame, roi_coords, expected_number=None, num_frames=3):
+    recognized_numbers = []
+
+    for _ in range(num_frames):
+        number = recognize_number(frame, roi_coords, expected_number)
+        if number:
+            recognized_numbers.append(number)
+        time.sleep(0.1)  # Short delay between frames
+
+    if not recognized_numbers:
+        return None
+
+    # Majority voting
+    most_common = max(set(recognized_numbers), key=recognized_numbers.count)
+    return most_common
+
+
 def check_webcam_status(cam, timeout=5, retries=3):
-    """
-    Checks if a specific webcam is accessible and functional with retries.
-    Additionally, recognizes a number within a defined ROI.
-
-    Args:
-        cam (dict): Dictionary containing webcam 'name', 'index', 'roi', and 'expected_number'.
-        timeout (int): Time in seconds to wait for the webcam.
-        retries (int): Number of retry attempts.
-
-    Returns:
-        bool: True if webcam is accessible and the recognized number matches the expected number, False otherwise.
-    """
     for attempt in range(retries):
         with suppress_stderr():
             cap = cv2.VideoCapture(cam['index'])
@@ -151,7 +167,7 @@ def check_webcam_status(cam, timeout=5, retries=3):
             time.sleep(1)
             continue
 
-        # **Set the desired resolution (1000x800)**
+        # **Set the desired resolution (800x600)**
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 800)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 600)
 
@@ -165,7 +181,7 @@ def check_webcam_status(cam, timeout=5, retries=3):
                 # Rotate the frame 90 degrees to the left (counter-clockwise) if necessary
                 rotated_frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
-                recognized_number = recognize_number(
+                recognized_number = recognize_number_aggregated(
                     rotated_frame,
                     (cam['roi']['x'], cam['roi']['y'], cam['roi']['w'], cam['roi']['h']),
                     cam.get('expected_number')

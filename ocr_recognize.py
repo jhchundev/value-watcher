@@ -4,14 +4,20 @@ from PIL import Image
 import numpy as np
 import logging
 
+from config import load_config
+
 # ================== OCR Configuration ==================
 
-# If Tesseract is not in your system's PATH, specify its location
-# For example, on Windows:
-# pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-
-# Uncomment and set the path if necessary
-# pytesseract.pytesseract.tesseract_cmd = r'YOUR_TESSERACT_PATH'
+config = load_config()
+WEBCAMS = config.get("webcams", [])
+SLACK_WEBHOOK_URL = config.get("slack_webhook_url", "")
+CHECK_INTERVAL = config.get("check_interval", 300)
+FAIL_THRESHOLD_PERCENT = config.get("fail_threshold_percent", 50)
+LOG_FILE = config.get("log_file", 'local_webcam_monitor.log')
+EXPORT_FILE = config.get("export_file", 'active_webcams.csv')
+SPECIFIC_ACTIVE_NUMBER = config.get("specific_active_number", 2)
+LOG_ROTATION_MAX_BYTES = config.get("log_rotation_max_bytes", 5 * 1024 * 1024)  # 5 MB
+LOG_ROTATION_BACKUP_COUNT = config.get("log_rotation_backup_count", 5)
 
 # ================== OCR Functions ==================
 
@@ -63,3 +69,33 @@ def recognize_number(frame, roi_coords, expected_number=None):
     return recognized_number if recognized_number else None
 
 
+def main():
+    # Configure logging
+    logging.basicConfig(
+        filename=LOG_FILE,
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        filemode='a',
+    )
+    # Load webcam configuration
+    if not WEBCAMS:
+        logging.error("No webcams configured. Exiting...")
+        return
+
+    # Initialize webcam capture
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        logging.error("Error: Could not open webcam.")
+        return
+
+    # Set webcam properties
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 800)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 600)
+
+    # Main loop
+    recognize_number(cap, {'x': 100, 'y': 100, 'w': 200, 'h': 100}, expected_number=150)
+
+
+if __name__ == "__main__":
+    main()
