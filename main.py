@@ -28,12 +28,11 @@ FAIL_THRESHOLD_PERCENT = config.get("fail_threshold_percent", 50)
 LOG_FILE = config.get("log_file", 'local_webcam_monitor.log')
 EXPORT_FILE = config.get("export_file", 'active_webcams.csv')
 SPECIFIC_ACTIVE_NUMBER = config.get("specific_active_number", 2)
-LOG_ROTATION_MAX_BYTES = config.get("log_rotation_max_bytes", 5*1024*1024)  # 5 MB
+LOG_ROTATION_MAX_BYTES = config.get("log_rotation_max_bytes", 5*1024*1024)
 LOG_ROTATION_BACKUP_COUNT = config.get("log_rotation_backup_count", 5)
 
 # ================== Logging Setup with Rotation ==================
 
-# Define a rotating file handler
 rotating_handler = RotatingFileHandler(
     LOG_FILE,
     maxBytes=LOG_ROTATION_MAX_BYTES,
@@ -42,28 +41,18 @@ rotating_handler = RotatingFileHandler(
 rotating_handler.setLevel(logging.INFO)
 rotating_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 
-# Define a console handler
 console_handler = logging.StreamHandler()
 console_handler.setLevel(logging.INFO)
 console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 
-# Configure the root logger
 logging.basicConfig(
     level=logging.INFO,
-    handlers=[
-        rotating_handler,
-        console_handler
-    ]
+    handlers=[rotating_handler, console_handler]
 )
 
 # ================== Context Manager to Suppress stderr ==================
-
 @contextmanager
 def suppress_stderr():
-    """
-    A context manager to suppress stderr temporarily.
-    Useful for suppressing OpenCV error messages.
-    """
     with open(os.devnull, "w") as devnull:
         old_stderr = sys.stderr
         sys.stderr = devnull
@@ -73,167 +62,178 @@ def suppress_stderr():
             sys.stderr = old_stderr
 
 # ================== OCR Configuration ==================
+# If needed, specify the full path to your Tesseract executable:
+# pytesseract.pytesseract.tesseract_cmd = r'/usr/bin/tesseract'  # Example on Linux
 
-# If Tesseract is not in your system's PATH, specify its location
-# For example, on Windows:
-# pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+# ================== Main Number Recognition Function ==================
 
-# Uncomment and set the path if necessary
-# pytesseract.pytesseract.tesseract_cmd = r'YOUR_TESSERACT_PATH'
-
-# ================== Functions ==================
-
-def recognize_number(frame, roi_coords, expected_number=None):
+def recognize_number(frame, roi_coords, expected_threshold=None, confidence_threshold=80):
     """
-    Recognizes a number within a specified region of a frame.
+    Recognizes a (yellow) number with optional decimal points from a black background.
 
-    Args:
-        frame (numpy.ndarray): The webcam frame.
-        roi_coords (tuple): Coordinates of the ROI (x, y, w, h).
-        expected_number (str or int, optional): The expected number for validation.
+    :param frame:           The full webcam frame as a NumPy array (BGR).
+    :param roi_coords:      Tuple (x, y, w, h) specifying the region-of-interest.
+    :param expected_threshold: A float indicating if recognized value > threshold => Slack alert.
+    :param confidence_threshold: Minimum average confidence (0-100) required from Tesseract.
 
-    Returns:
-        str: The recognized number.
+    :return: (recognized_value, is_over_threshold)
+             recognized_value is a float or None if failed.
+             is_over_threshold is a boolean indicating if the recognized value > expected_threshold.
     """
     x, y, w, h = roi_coords
     roi = frame[y:y+h, x:x+w]
 
-    # Preprocessing
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    # Apply Gaussian Blur to reduce noise
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    # Apply thresholding to get a binary image
-    _, thresh = cv2.threshold(blurred, 150, 255, cv2.THRESH_BINARY_INV)
-    # Optionally, apply dilation or erosion to enhance features
-    kernel = np.ones((2,2), np.uint8)
-    processed = cv2.dilate(thresh, kernel, iterations=1)
+    # Convert to HSV for easier color segmentation
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
-    # OCR
-    pil_img = Image.fromarray(processed)
+    # Define a mask range for "yellow" text. Adjust as necessary.
+    # Hue range for yellow is typically around 20-35, but fine-tune
+    YELLOW_LOWER = np.array([20, 100, 100])
+    YELLOW_UPPER = np.array([35, 255, 255])
+
+    mask = cv2.inRange(hsv, YELLOW_LOWER, YELLOW_UPPER)
+
+    # Morphological cleanup
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    # We have a mask isolating the yellow text on black background.
+    # Convert masked area back to grayscale
+    masked_roi = cv2.bitwise_and(roi, roi, mask=mask)
+    gray = cv2.cvtColor(masked_roi, cv2.COLOR_BGR2GRAY)
+
+    # In many black background + colored text scenarios, Otsu's threshold often works well:
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+
+    # Additional morphological steps to remove small specks
+    morph = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    # Resize for better OCR accuracy
+    # Increase factor if text is small
+    processed = cv2.resize(morph, None, fx=3, fy=3, interpolation=cv2.INTER_LINEAR)
+
+    # Tesseract config: psm=8 (single word/line), whitelisting digits and the decimal point
     custom_config = r'--oem 3 --psm 8 -c tessedit_char_whitelist=0123456789'
-    data = pytesseract.image_to_data(pil_img, config=custom_config, output_type=pytesseract.Output.DICT)
+    data = pytesseract.image_to_data(processed, config=custom_config, output_type=pytesseract.Output.DICT)
 
-    recognized_number = ''
+    recognized_string = ""
     confidences = []
 
-    for i, word in enumerate(data['text']):
-        if word.strip().isdigit():
-            recognized_number += word.strip()
-            confidences.append(int(data['conf'][i]))
+    for i, text_val in enumerate(data['text']):
+        if text_val.strip():
+            # Filter out clearly invalid tokens (like leftover letters or weird symbols)
+            # Since we used whitelist, mostly digits and '.' come through, but let's be safe
+            valid_chars = [ch for ch in text_val if ch.isdigit() or ch == '.']
+            filtered_text = "".join(valid_chars)
+            if filtered_text:
+                recognized_string += filtered_text
+                conf = data['conf'][i]
+                if conf != -1:  # Tesseract can give -1 for "no confidence"
+                    confidences.append(float(conf))
 
-    if not recognized_number:
-        logging.warning("No valid digits recognized.")
-        return None
+    if not recognized_string:
+        logging.warning("No valid digits recognized in the ROI.")
+        return None, False
 
-    average_confidence = np.mean(confidences)
-    if average_confidence < 0.5:
-        logging.warning(f"Low OCR confidence ({average_confidence:.2f}%). Recognized number: {recognized_number}")
-        return None
+    if not confidences:  # Means Tesseract returned -1 or no bounding box
+        logging.warning("Unable to get any confidence values from Tesseract.")
+        return None, False
 
-    # Validation (optional)
-    if expected_number is not None:
-        if str(recognized_number) != str(expected_number):
-            logging.warning(f"Recognized number {recognized_number} does not match expected {expected_number}.")
-            return None
+    avg_confidence = np.mean(confidences)
+    if avg_confidence < confidence_threshold:
+        logging.warning(
+            f"Low OCR confidence ({avg_confidence:.2f}). "
+            f"Raw recognized string: '{recognized_string}'"
+        )
+        return None, False
 
-    return recognized_number
+    # Now parse recognized_string as float
+    try:
+        recognized_value = float(recognized_string)
+    except ValueError:
+        logging.warning(f"Could not parse recognized text '{recognized_string}' as float.")
+        return None, False
 
+    # Check if recognized value is over the threshold
+    is_over_threshold = False
+    if expected_threshold is not None and recognized_value > expected_threshold:
+        is_over_threshold = True
 
-def recognize_number_aggregated(frame, roi_coords, expected_number=None, num_frames=3):
-    recognized_numbers = []
+    return recognized_value, is_over_threshold
 
-    for _ in range(num_frames):
-        number = recognize_number(frame, roi_coords, expected_number)
-        if number:
-            recognized_numbers.append(number)
-        time.sleep(0.1)  # Short delay between frames
+# ================== Aggregated Recognition ==================
 
-    if not recognized_numbers:
-        return None
+def recognize_number_aggregated(frame, roi_coords, expected_threshold=None, attempts=3):
+    """
+    Tries multiple times to recognize a number from the same frame region.
+    If successful in any attempt, returns the most common recognized float.
+    Also returns True if it crosses the threshold in any attempt.
 
-    # Majority voting
-    most_common = max(set(recognized_numbers), key=recognized_numbers.count)
-    return most_common
+    :param frame:            The frame.
+    :param roi_coords:       (x, y, w, h).
+    :param expected_threshold: If recognized value > threshold => Slack.
+    :param attempts:         Number of attempts to do OCR.
 
+    :return: (final_value, is_over_threshold)
+    """
+    recognized_vals = []
+    threshold_hits = 0
 
-def check_webcam_status(cam, timeout=5, retries=3):
-    for attempt in range(retries):
-        with suppress_stderr():
-            cap = cv2.VideoCapture(cam['index'])
+    for _ in range(attempts):
+        val, over_flag = recognize_number(frame, roi_coords, expected_threshold)
+        if val is not None:
+            recognized_vals.append(val)
+            if over_flag:
+                threshold_hits += 1
+        time.sleep(0.1)  # small delay
 
-        if not cap.isOpened():
-            logging.error(
-                f"{cam['name']} (Index {cam['index']}) could not be opened. Attempt {attempt + 1} of {retries}.")
-            time.sleep(1)
-            continue
+    if not recognized_vals:
+        return None, False
 
-        # **Set the desired resolution (800x600)**
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 800)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 600)
+    # Get the most common recognized float (simple mode approach)
+    # Because floats can be slightly different, we can round them or
+    # just pick the last recognized. If you want "true" majority voting,
+    # consider rounding to 1-2 decimals for grouping.
+    # Example: round to 1 decimal
+    recognized_rounded = [round(x, 1) for x in recognized_vals]
+    most_common_rounded = max(set(recognized_rounded), key=recognized_rounded.count)
 
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        start_time = time.time()
-        recognized_number = None
+    # If you want the *closest float* from recognized_vals to that mode, pick it:
+    best_val = None
+    min_diff = float('inf')
+    for rv in recognized_vals:
+        if abs(round(rv, 1) - most_common_rounded) < min_diff:
+            min_diff = abs(round(rv, 1) - most_common_rounded)
+            best_val = rv
 
-        while True:
-            ret, frame = cap.read()
-            if ret:
-                # Rotate the frame 90 degrees to the left (counter-clockwise) if necessary
-                rotated_frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    # If any attempt indicated it's over the threshold => report True
+    is_any_over_threshold = (threshold_hits > 0)
+    return best_val, is_any_over_threshold
 
-                recognized_number = recognize_number_aggregated(
-                    rotated_frame,
-                    (cam['roi']['x'], cam['roi']['y'], cam['roi']['w'], cam['roi']['h']),
-                    cam.get('expected_number')
-                )
-                if recognized_number is not None:
-                    logging.info(f"{cam['name']} (Index {cam['index']}): Recognized Number: {recognized_number}")
-                    cap.release()
-                    return True
-                else:
-                    logging.warning(f"{cam['name']} (Index {cam['index']}): Number mismatch or recognition failed.")
-                    break
-            elif time.time() - start_time > timeout:
-                logging.error(f"{cam['name']} (Index {cam['index']}) is unresponsive.")
-                cap.release()
-                break
-            time.sleep(0.5)
-
-        cap.release()
-    return False
+# ================== Slack Notification ==================
 
 def send_slack_notification(message):
-    """
-    Sends a notification message to Slack.
-
-    Args:
-        message (str): The message to send to Slack.
-    """
-    payload = {
-        "text": message
-    }
+    payload = {"text": message}
     try:
         response = requests.post(SLACK_WEBHOOK_URL, json=payload)
         if response.status_code != 200:
-            logging.error(f'Failed to send Slack notification. Status code: {response.status_code}, Response: {response.text}')
+            logging.error(
+                f'Failed to send Slack notification. '
+                f'Status code: {response.status_code}, Response: {response.text}'
+            )
         else:
             logging.info('Slack notification sent successfully.')
     except requests.RequestException as e:
         logging.error(f'Error sending Slack notification: {e}')
 
-def export_log_info(active_cams, export_file='active_webcams.csv'):
-    """
-    Exports the list of active webcams to a CSV file.
+# ================== Export Info to CSV ==================
 
-    Args:
-        active_cams (list): List of active webcam names.
-        export_file (str): Path to the export CSV file.
-    """
+def export_log_info(active_cams, export_file='active_webcams.csv'):
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     try:
         with open(export_file, mode='a', newline='') as file:
             writer = csv.writer(file)
-            # Write header if file is empty
             if os.stat(export_file).st_size == 0:
                 writer.writerow(['Timestamp', 'Active Webcams'])
             writer.writerow([timestamp, '; '.join(active_cams)])
@@ -241,13 +241,9 @@ def export_log_info(active_cams, export_file='active_webcams.csv'):
     except Exception as e:
         logging.error(f'Failed to export active webcams: {e}')
 
-def periodic_export(export_interval=3600):
-    """
-    Periodically exports the log file to a specified location.
+# ================== Periodic Export of Logs ==================
 
-    Args:
-        export_interval (int): Time between exports in seconds.
-    """
+def periodic_export(export_interval=3600):
     while True:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         destination = f'exported_logs/webcam_monitor_{timestamp}.log'
@@ -259,13 +255,89 @@ def periodic_export(export_interval=3600):
             logging.error(f'Failed to export log file: {e}')
         time.sleep(export_interval)
 
+# ================== Webcam Check ==================
+
+def check_webcam_status(cam, timeout=5, retries=3):
+    """
+    Attempt to open a webcam multiple times, read frames, and run OCR to see if
+    a valid number is recognized. If recognized, also check if it is above the threshold.
+    """
+    for attempt in range(retries):
+        with suppress_stderr():
+            cap = cv2.VideoCapture(cam['index'])
+
+        if not cap.isOpened():
+            logging.error(
+                f"{cam['name']} (Index {cam['index']}) could not be opened. "
+                f"Attempt {attempt + 1} of {retries}."
+            )
+            time.sleep(1)
+            continue
+
+        # Optional: set desired resolution
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 800)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 600)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        start_time = time.time()
+
+        recognized_value = None
+        is_over_threshold = False
+
+        while True:
+            ret, frame = cap.read()
+            if ret:
+                # If your camera orientation is rotated, rotate if needed:
+                # e.g., rotate 90 deg CCW
+                rotated_frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+                # Attempt to recognize the number multiple times
+                recognized_value, is_over_threshold = recognize_number_aggregated(
+                    rotated_frame,
+                    (cam['roi']['x'], cam['roi']['y'], cam['roi']['w'], cam['roi']['h']),
+                    expected_threshold=cam.get('threshold_value', 50),
+                    attempts=3
+                )
+
+                if recognized_value is not None:
+                    logging.info(
+                        f"{cam['name']} (Index {cam['index']}): "
+                        f"Recognized Number: {recognized_value}"
+                    )
+
+                    # If threshold is crossed, send Slack
+                    if is_over_threshold:
+                        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        message = (
+                            f":exclamation: *Threshold Alert*\n"
+                            f"At {timestamp}, {cam['name']} recognized value "
+                            f"({recognized_value}) is above threshold."
+                        )
+                        send_slack_notification(message)
+
+                    cap.release()
+                    return True
+                else:
+                    # We recognized *nothing*, break to try next attempt.
+                    logging.warning(
+                        f"{cam['name']} (Index {cam['index']}): Number recognition failed this round."
+                    )
+                    break
+            elif time.time() - start_time > timeout:
+                logging.error(f"{cam['name']} (Index {cam['index']}) is unresponsive.")
+                cap.release()
+                break
+
+            time.sleep(0.5)
+
+        cap.release()
+    return False
+
+# ================== Main Monitoring Loop ==================
+
 def monitor_webcams():
-    """
-    Main function to monitor webcams and send notifications based on failure thresholds.
-    Includes OCR-based number recognition within defined ROIs.
-    """
     logging.info('Starting webcam monitoring service...')
-    WEBCAM_STATUS = {cam['name']: True for cam in WEBCAMS}  # Initial status
+    WEBCAM_STATUS = {cam['name']: True for cam in WEBCAMS}  # Keep track of last known status
 
     while True:
         total_cams = len(WEBCAMS)
@@ -282,43 +354,46 @@ def monitor_webcams():
                 if not is_up:
                     failures += 1
                     failed_cams.append(cam['name'])
+                    # If previously it was up, now we notify Slack that it failed
                     if WEBCAM_STATUS[cam['name']]:
-                        # Webcam just failed
                         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                         message = (
                             f":warning: *Webcam Alert*\n"
-                            f"At {timestamp}, {cam['name']} is not responding or recognized number is incorrect."
+                            f"At {timestamp}, {cam['name']} is not responding or "
+                            f"no valid number recognized."
                         )
                         send_slack_notification(message)
                         WEBCAM_STATUS[cam['name']] = False
                 else:
                     active_cams.append(cam['name'])
                     if not WEBCAM_STATUS[cam['name']]:
-                        # Webcam just recovered
+                        # Recovery
                         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                         message = (
                             f":white_check_mark: *Webcam Recovery*\n"
-                            f"At {timestamp}, {cam['name']} has started responding again with correct number."
+                            f"At {timestamp}, {cam['name']} is responding again with valid number."
                         )
                         send_slack_notification(message)
                         WEBCAM_STATUS[cam['name']] = True
-                time.sleep(1)  # Brief pause between checks
+                time.sleep(1)
 
-            failure_percentage = (failures / total_cams) * 100
+            # Logging status
+            failure_percentage = (failures / total_cams) * 100 if total_cams else 0
             logging.info(f'Webcam Check: {failures}/{total_cams} failures ({failure_percentage:.2f}%)')
             logging.info(f'Active Webcams: {", ".join(active_cams)}')
 
-            # Specific Condition: When exactly SPECIFIC_ACTIVE_NUMBER webcams are active
+            # Export info if exactly SPECIFIC_ACTIVE_NUMBER cameras are active
             if len(active_cams) == SPECIFIC_ACTIVE_NUMBER:
                 export_log_info(active_cams, EXPORT_FILE)
 
+            # If failure threshold met, send an aggregate alert
             if failure_percentage >= FAIL_THRESHOLD_PERCENT:
                 timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 failed_cam_names = ', '.join(failed_cams)
                 message = (
                     f":warning: *Webcam Alert*\n"
-                    f"At {timestamp}, {failures} out of {total_cams} webcams are not responding "
-                    f"({failure_percentage:.2f}%).\n"
+                    f"At {timestamp}, {failures} out of {total_cams} webcams "
+                    f"are failing ({failure_percentage:.2f}%).\n"
                     f"Failed webcams: {failed_cam_names}"
                 )
                 send_slack_notification(message)
@@ -329,12 +404,10 @@ def monitor_webcams():
         time.sleep(CHECK_INTERVAL)
 
 # ================== Start Periodic Export in Separate Thread ==================
-
-export_thread = threading.Thread(target=periodic_export, args=(3600,), daemon=True)  # Export every hour
+export_thread = threading.Thread(target=periodic_export, args=(3600,), daemon=True)  # Export logs every hour
 export_thread.start()
 
 # ================== Entry Point ==================
-
 if __name__ == '__main__':
     try:
         monitor_webcams()
