@@ -164,24 +164,22 @@ def recognize_number(frame, roi_coords, expected_threshold=None, confidence_thre
 
 # ================== Aggregated Recognition ==================
 
-def recognize_number_aggregated(frame, roi_coords, expected_threshold=None, attempts=3):
+def recognize_number_aggregated(frame, roi_coords, expected_threshold=None, attempts=3, confidence_threshold=80):
     """
     Tries multiple times to recognize a number from the same frame region.
-    If successful in any attempt, returns the most common recognized float.
-    Also returns True if it crosses the threshold in any attempt.
-
-    :param frame:            The frame.
-    :param roi_coords:       (x, y, w, h).
-    :param expected_threshold: If recognized value > threshold => Slack.
-    :param attempts:         Number of attempts to do OCR.
-
-    :return: (final_value, is_over_threshold)
+    ...
+    :param confidence_threshold: Minimum confidence to accept the recognized digits
     """
     recognized_vals = []
     threshold_hits = 0
 
     for _ in range(attempts):
-        val, over_flag = recognize_number(frame, roi_coords, expected_threshold)
+        val, over_flag = recognize_number(
+            frame,
+            roi_coords,
+            expected_threshold,
+            confidence_threshold=confidence_threshold
+        )
         if val is not None:
             recognized_vals.append(val)
             if over_flag:
@@ -191,15 +189,10 @@ def recognize_number_aggregated(frame, roi_coords, expected_threshold=None, atte
     if not recognized_vals:
         return None, False
 
-    # Get the most common recognized float (simple mode approach)
-    # Because floats can be slightly different, we can round them or
-    # just pick the last recognized. If you want "true" majority voting,
-    # consider rounding to 1-2 decimals for grouping.
-    # Example: round to 1 decimal
+    # ... (rest of the code remains unchanged) ...
     recognized_rounded = [round(x, 1) for x in recognized_vals]
     most_common_rounded = max(set(recognized_rounded), key=recognized_rounded.count)
 
-    # If you want the *closest float* from recognized_vals to that mode, pick it:
     best_val = None
     min_diff = float('inf')
     for rv in recognized_vals:
@@ -207,7 +200,6 @@ def recognize_number_aggregated(frame, roi_coords, expected_threshold=None, atte
             min_diff = abs(round(rv, 1) - most_common_rounded)
             best_val = rv
 
-    # If any attempt indicated it's over the threshold => report True
     is_any_over_threshold = (threshold_hits > 0)
     return best_val, is_any_over_threshold
 
@@ -257,7 +249,7 @@ def periodic_export(export_interval=3600):
 
 # ================== Webcam Check ==================
 
-def check_webcam_status(cam, timeout=5, retries=3):
+def check_webcam_status(cam, timeout=5, retries=5):
     """
     Attempt to open a webcam multiple times, read frames, and run OCR to see if
     a valid number is recognized. If recognized, also check if it is above the threshold.
@@ -296,7 +288,8 @@ def check_webcam_status(cam, timeout=5, retries=3):
                     rotated_frame,
                     (cam['roi']['x'], cam['roi']['y'], cam['roi']['w'], cam['roi']['h']),
                     expected_threshold=cam.get('threshold_value', 50),
-                    attempts=3
+                    attempts=5,
+                    confidence_threshold=50
                 )
 
                 if recognized_value is not None:
