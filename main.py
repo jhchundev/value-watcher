@@ -31,6 +31,8 @@ EXPORT_FILE = config.get("export_file", 'active_webcams.csv')
 SPECIFIC_ACTIVE_NUMBER = config.get("specific_active_number", 2)
 LOG_ROTATION_MAX_BYTES = config.get("log_rotation_max_bytes", 5 * 1024 * 1024)
 LOG_ROTATION_BACKUP_COUNT = config.get("log_rotation_backup_count", 5)
+OCR_CONFIDENCE_THRESHOLD = config.get("ocr_confidence_threshold", 50)
+IMAGE_GRABS_PER_CHECK = config.get("image_grabs_per_check", 2)  # New configuration
 
 # ================== Logging Setup with Rotation ==================
 
@@ -132,7 +134,7 @@ def extract_text_from_image(image: np.ndarray) -> Tuple[str, List[float]]:
 # ================== Number Recognition Classes ==================
 
 class NumberRecognizer:
-    def __init__(self, confidence_threshold: int = 80):
+    def __init__(self, confidence_threshold: int = OCR_CONFIDENCE_THRESHOLD):
         self.confidence_threshold = confidence_threshold
 
     def recognize_number(
@@ -186,32 +188,40 @@ class NumberRecognizer:
         return recognized_value, is_over_threshold
 
 class AggregatedNumberRecognizer:
-    def __init__(self, attempts: int = 5, confidence_threshold: int = 80):
-        self.attempts = attempts
-        self.confidence_threshold = confidence_threshold
-        self.recognizer = NumberRecognizer(confidence_threshold=self.confidence_threshold)
+    def __init__(
+        self,
+        recognizer: NumberRecognizer,
+        image_grabs: int = IMAGE_GRABS_PER_CHECK,
+        delay_between_grabs: float = 0.1
+    ):
+        self.recognizer = recognizer
+        self.image_grabs = image_grabs
+        self.delay_between_grabs = delay_between_grabs
 
     def recognize_number_aggregated(
         self,
-        frame: np.ndarray,
+        frame_provider,
         roi_coords: Tuple[int, int, int, int],
-        expected_threshold: Optional[int] = None,
-        delay_between_attempts: float = 0.1
+        expected_threshold: Optional[int] = None
     ) -> Tuple[Optional[int], bool]:
         """
-        Attempts to recognize a number multiple times and aggregates the results.
+        Attempts to recognize a number by grabbing multiple distinct images and performing OCR on each.
 
-        :param frame: The full webcam frame as a NumPy array (BGR).
+        :param frame_provider: A callable that provides the current frame from the webcam.
         :param roi_coords: Tuple (x, y, w, h) specifying the region-of-interest.
         :param expected_threshold: An integer indicating if recognized value > threshold => Slack alert.
-        :param delay_between_attempts: Delay between retry attempts in seconds.
 
         :return: (best_recognized_value, is_any_over_threshold)
         """
         recognized_vals = []
         threshold_hits = 0
 
-        for attempt in range(self.attempts):
+        for grab in range(1, self.image_grabs + 1):
+            frame = frame_provider()
+            if frame is None:
+                logging.warning(f"Failed to grab frame {grab} for OCR.")
+                continue
+
             val, over_flag = self.recognizer.recognize_number(
                 frame,
                 roi_coords,
@@ -221,7 +231,7 @@ class AggregatedNumberRecognizer:
                 recognized_vals.append(val)
                 if over_flag:
                     threshold_hits += 1
-            time.sleep(delay_between_attempts)  # Small delay between attempts
+            time.sleep(self.delay_between_grabs)  # Small delay between grabs
 
         if not recognized_vals:
             return None, False
@@ -229,7 +239,7 @@ class AggregatedNumberRecognizer:
         # Determine the most common recognized value
         most_common_val = max(set(recognized_vals), key=recognized_vals.count)
 
-        # Optionally, select the value closest to the most common value
+        # Select the value closest to the most common value
         best_val = min(recognized_vals, key=lambda x: abs(x - most_common_val))
 
         is_any_over_threshold = (threshold_hits > 0)
@@ -282,89 +292,94 @@ def periodic_export(export_interval: int = 3600, log_file: str = LOG_FILE) -> No
 # ================== Webcam Checker ==================
 
 class WebcamChecker:
-    def __init__(self, webcam: dict, retries: int = 10, timeout: int = 5):
+    def __init__(self, webcam: dict, timeout: int = 5):
         self.name = webcam['name']
         self.index = webcam['index']
         self.roi = (webcam['roi']['x'], webcam['roi']['y'],
                     webcam['roi']['w'], webcam['roi']['h'])
         self.threshold_value = webcam.get('threshold_value', 50)
-        self.retries = retries
         self.timeout = timeout
-        self.recognizer = AggregatedNumberRecognizer(attempts=self.retries)
+        self.recognizer = AggregatedNumberRecognizer(
+            recognizer=NumberRecognizer(confidence_threshold=OCR_CONFIDENCE_THRESHOLD),
+            image_grabs=IMAGE_GRABS_PER_CHECK,
+            delay_between_grabs=0.1
+        )
+
+    def get_frame(self, cap) -> Optional[np.ndarray]:
+        """
+        Retrieves a single frame from the VideoCapture object.
+
+        :param cap: The VideoCapture object.
+        :return: The captured frame or None if unsuccessful.
+        """
+        ret, frame = cap.read()
+        if ret:
+            # Rotate frame if necessary
+            rotated_frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            return rotated_frame
+        else:
+            return None
 
     def check_status(self) -> bool:
         """
-        Attempts to open the webcam, read frames, and perform OCR to recognize numbers.
+        Attempts to open the webcam, read multiple frames, and perform OCR to recognize numbers.
         Returns True if successful, False otherwise.
         """
-        for attempt in range(1, self.retries + 1):
-            with suppress_stderr():
-                cap = cv2.VideoCapture(self.index)
+        with suppress_stderr():
+            cap = cv2.VideoCapture(self.index)
 
-            if not cap.isOpened():
-                logging.error(
-                    f"{self.name} (Index {self.index}) could not be opened. "
-                    f"Attempt {attempt} of {self.retries}."
+        if not cap.isOpened():
+            logging.error(
+                f"{self.name} (Index {self.index}) could not be opened."
+            )
+            time.sleep(1)
+            return False
+
+        # Optional: set desired resolution
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 800)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 600)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        start_time = time.time()
+
+        recognized_value = None
+        is_over_threshold = False
+
+        def frame_provider():
+            return self.get_frame(cap)
+
+        # Perform OCR on multiple image grabs
+        recognized_value, is_over_threshold = self.recognizer.recognize_number_aggregated(
+            frame_provider=frame_provider,
+            roi_coords=self.roi,
+            expected_threshold=self.threshold_value
+        )
+
+        cap.release()
+
+        if recognized_value is not None:
+            logging.info(
+                f"{self.name} (Index {self.index}): "
+                f"Recognized Number: {recognized_value}"
+            )
+
+            # If threshold is crossed, send Slack
+            if is_over_threshold:
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                message = (
+                    f":exclamation: *Threshold Alert*\n"
+                    f"At {timestamp}, {self.name} recognized value "
+                    f"({recognized_value}) is above threshold."
                 )
-                time.sleep(1)
-                continue
+                send_slack_notification(message)
 
-            # Optional: set desired resolution
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 800)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 600)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-            start_time = time.time()
-
-            recognized_value = None
-            is_over_threshold = False
-
-            while True:
-                ret, frame = cap.read()
-                if ret:
-                    # Rotate frame if necessary
-                    rotated_frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-
-                    # Attempt to recognize the number
-                    recognized_value, is_over_threshold = self.recognizer.recognize_number_aggregated(
-                        rotated_frame,
-                        self.roi,
-                        expected_threshold=self.threshold_value
-                    )
-
-                    if recognized_value is not None:
-                        logging.info(
-                            f"{self.name} (Index {self.index}): "
-                            f"Recognized Number: {recognized_value}"
-                        )
-
-                        # If threshold is crossed, send Slack
-                        if is_over_threshold:
-                            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                            message = (
-                                f":exclamation: *Threshold Alert*\n"
-                                f"At {timestamp}, {self.name} recognized value "
-                                f"({recognized_value}) is above threshold."
-                            )
-                            send_slack_notification(message)
-
-                        cap.release()
-                        return True
-                    else:
-                        # Recognition failed; try next attempt
-                        logging.warning(
-                            f"{self.name} (Index {self.index}): Number recognition failed on attempt {attempt}."
-                        )
-                        break
-                elif time.time() - start_time > self.timeout:
-                    logging.error(f"{self.name} (Index {self.index}) is unresponsive.")
-                    break
-
-                time.sleep(0.5)
-
-            cap.release()
-
-        return False
+            return True
+        else:
+            # Recognition failed after all image grabs
+            logging.warning(
+                f"{self.name} (Index {self.index}): Number recognition failed after {IMAGE_GRABS_PER_CHECK} image grabs."
+            )
+            return False
 
 # ================== Main Monitoring Loop ==================
 
